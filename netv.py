@@ -86,17 +86,22 @@ class I2CMaster:
         return [i2c_msg_to_bytes(m) for m in msgs if (m.flags & I2C_M_RD)]
 
 def i2c_read(addr, n_bytes):
-    return _new_i2c_msg(addr, I2C_M_RD, create_string_buffer(n_bytes))
+	return _new_i2c_msg(addr, I2C_M_RD, create_string_buffer(n_bytes))
 
-def i2c_write(addr, byte):
-    return _new_i2c_msg(addr, 0, create_string_buffer(struct.pack("B", byte), 1))
+def i2c_write(addr, *bytes):
+	bufferToSend = ""
+	for theByte in bytes:
+		bufferToSend += struct.pack("B", theByte)
+		
+	finalStringBuffer = create_string_buffer(bufferToSend, len(bytes))
+	return _new_i2c_msg(addr, 0, finalStringBuffer)
 
 def _new_i2c_msg(addr, flags, buf):
-    #print sizeof(buf), repr(buf.raw)
-    return i2c_msg(addr=addr, flags=flags, len=sizeof(buf), buf=buf)
+	#print sizeof(buf), repr(buf.raw)
+	return i2c_msg(addr=addr, flags=flags, len=sizeof(buf), buf=buf)
 
 def i2c_msg_to_bytes(m):
-    return string_at(m.buf, m.len)
+	return string_at(m.buf, m.len)
 
 
 
@@ -107,8 +112,12 @@ def i2c_msg_to_bytes(m):
 ''' NeTv FPGA interface '''
 class fpga(object):
 	DEVADDR = 0x3C
+	
+	FPGA_COMP_CTL_ADR = 0x03
+	FPGA_EXT1_CTL = 0xC
 	FPGA_DNA_ADR = 0x38 
 	FPGA_MAJOR_ADR = 0x3f
+
 
 	def __init__(self):
 		self._fpga_filename = "/dev/fpga"
@@ -119,36 +128,99 @@ class fpga(object):
 	def __del__(self):
 		if self._fpga_file:
 			self._fpga_file.close()
+			
+	def _fetch_register(self, register):
+		read_results = self._i2c_bus.transaction(
+				i2c_write(self.DEVADDR >> 1, register),
+				i2c_read(self.DEVADDR >> 1, 1))
+				
+		return ord(read_results[0])
 	
 	def deviceId(self):
 		deviceId = ""
 	
 		for i in range(7):
-			read_results = self._i2c_bus.transaction(
-				i2c_write(self.DEVADDR >> 1, self.FPGA_DNA_ADR + i),
-				i2c_read(self.DEVADDR >> 1, 1))
-				
-			deviceId += "%02x" % ord(read_results[0])
+			deviceId += "%02x" % self._fetch_register(self.FPGA_DNA_ADR + i)
 			
 		return deviceId
 
 	def version(self):		
-		read_results = self._i2c_bus.transaction(
-					i2c_write(self.DEVADDR >> 1, self.FPGA_MAJOR_ADR),
-					i2c_read(self.DEVADDR >> 1, 1))
-				
-		return ord(read_results[0])
+		return self._fetch_register(self.FPGA_MAJOR_ADR)
+	
+	def dump_register(self, register):
+		print "0x%02x: %02x" % (register, self._fetch_register(register))
 		
 	def dump_registers(self):	
 		print ""
 		for n in range(8):
-			myBytes = [0,0,0,0]
-			for i in range(4):	
-				read_results = self._i2c_bus.transaction(
-						i2c_write(self.DEVADDR >> 1, (n * 4) + i),
-						i2c_read(self.DEVADDR >> 1, 1))
-						
-				myBytes[i] = read_results[0]
-				
-			print "0x%02x: %02x %02x %02x %02x" % ((n*4), ord(myBytes[0]), ord(myBytes[1]), ord(myBytes[2]), ord(myBytes[3]))
+			print "0x%02x:" % (n*4),
+			for i in range(4):
+				print "%02x" % self._fetch_register((n*4) + i),
+			print ""
 		print ""
+	
+	
+	''' Manage the state of the compositing '''
+	@property
+	def compositing(self):
+		return self._fetch_register(self.FPGA_COMP_CTL_ADR) & 0x4 == 0x4
+	
+	@compositing.setter
+	def compositing(self, compositingState):
+		existingRegisterValue = self._fetch_register(self.FPGA_COMP_CTL_ADR)
+		if (compositingState):
+			newRegisterValue = (existingRegisterValue | 0x4)
+		else:
+			newRegisterValue = (existingRegisterValue & ~0x4)
+		self._i2c_bus.transaction(i2c_write(self.DEVADDR >> 1, self.FPGA_COMP_CTL_ADR, newRegisterValue))
+		
+	
+	
+	
+	
+	'''Manage the transparency of the overlay '''
+	@property	
+	def alphaState(self):
+		return self._fetch_register(self.FPGA_EXT1_CTL) & 0x10 == 0x10
+	
+	@alphaState.setter
+	def alphaState(self, stateValue):
+		existingRegisterValue = self._fetch_register(self.FPGA_EXT1_CTL)
+		if (stateValue):
+			newRegisterValue = (existingRegisterValue | 0x10)
+		else:
+			newRegisterValue = (existingRegisterValue & ~0x10)
+		self._i2c_bus.transaction(i2c_write(self.DEVADDR >> 1, self.FPGA_EXT1_CTL, newRegisterValue))
+					
+
+	@property	
+	def alphaValue(self):
+		existingRegisterValue = self._fetch_register(self.FPGA_EXT1_CTL)
+		rawValue = ((existingRegisterValue & 0x80) >> 0x5) + ((existingRegisterValue & 0x40) >> 0x5) + ((existingRegisterValue & 0x20) >> 0x5)
+		
+		return (rawValue) * (1.0 - 0.0) / (7.0 - 0.0)
+	
+	@alphaValue.setter
+	def alphaValue(self, alphaValue):
+		#map the passed in alpha value (needs to be float - TODO validate) to our 3 bit value
+		mappedValue = int(round((alphaValue) * (7 - 0) / (1 - 0)))
+		
+		existingRegisterValue = self._fetch_register(self.FPGA_EXT1_CTL)
+		newRegisterValue = existingRegisterValue
+		
+		if (mappedValue & 0x04):
+			newRegisterValue = newRegisterValue | 0x80
+		else:
+			newRegisterValue = newRegisterValue & ~0x80
+			
+		if (mappedValue & 0x02):
+			newRegisterValue = newRegisterValue | 0x40
+		else:
+			newRegisterValue = newRegisterValue & ~0x40
+
+		if (mappedValue & 0x01):
+			newRegisterValue = newRegisterValue | 0x20
+		else:
+			newRegisterValue = newRegisterValue & ~0x20
+			
+		self._i2c_bus.transaction(i2c_write(self.DEVADDR >> 1, self.FPGA_EXT1_CTL, newRegisterValue))
